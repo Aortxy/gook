@@ -1,0 +1,95 @@
+const { applyFingerprint } = require("../module/fingerprint");
+
+function getSource({ url, proxy, waitForMs, waitForSelector, waitForSelectorTimeout, cookies }) {
+  return new Promise(async (resolve, reject) => {
+    if (!url) return reject("Missing url parameter");
+
+    const extraWait = Math.min(Number(waitForMs) || 0, 30000);
+    const selectorToWait = waitForSelector || null;
+    const selectorTimeout = Math.min(Number(waitForSelectorTimeout) || 30000, 60000);
+    
+    const context = await global.browser
+      .createBrowserContext({
+        proxyServer: proxy ? `http://${proxy.host}:${proxy.port}` : undefined,
+      })
+      .catch(() => null);
+    
+    if (!context) return reject("Failed to create browser context");
+
+    let isResolved = false;
+
+    var cl = setTimeout(async () => {
+      if (!isResolved) {
+        await context.close();
+        reject("Timeout Error");
+      }
+    }, global.timeOut || 60000);
+
+    try {
+      const page = await context.newPage();
+      await applyFingerprint(page);
+
+      if (cookies && Array.isArray(cookies) && cookies.length > 0) {
+        await page.setCookie(...cookies);
+      }
+
+      if (proxy?.username && proxy?.password) {
+        await page.authenticate({
+          username: proxy.username,
+          password: proxy.password,
+        });
+      }
+
+      await page.setRequestInterception(true);
+      page.on("request", (request) => {
+        const type = request.resourceType();
+        if (["image", "font", "media", "stylesheet"].includes(type) || request.url().includes("google-analytics") || request.url().includes("doubleclick")) {
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
+      
+      page.on("response", async (res) => {
+        try {
+          if (
+            [200, 302].includes(res.status()) &&
+            [url, url + "/"].includes(res.url())
+          ) {
+            await page
+              .waitForNavigation({ waitUntil: "load", timeout: 8000 })
+              .catch(() => {});
+              
+            if (selectorToWait) {
+              await page
+                .waitForSelector(selectorToWait, { timeout: selectorTimeout })
+                .catch(() => {});
+            } else if (extraWait > 0) {
+              await new Promise((r) => setTimeout(r, extraWait));
+            }
+            
+            const html = await page.content();
+            await context.close();
+            isResolved = true;
+            clearInterval(cl);
+            resolve(html);
+          }
+        } catch (e) {}
+      });
+
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 60000
+      });
+
+    } catch (e) {
+      if (!isResolved) {
+        await context.close();
+        clearInterval(cl);
+        reject(e.message);
+      }
+    }
+  });
+}
+
+module.exports = getSource;
