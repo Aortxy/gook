@@ -1,13 +1,9 @@
-const { applyFingerprint } = require("../module/fingerprint");
+const { applyFingerprint, pick, USER_AGENTS } = require("../module/fingerprint");
 
 function getSource({ url, proxy, waitForMs, waitForSelector, waitForSelectorTimeout, cookies }) {
   return new Promise(async (resolve, reject) => {
     if (!url) return reject("Missing url parameter");
 
-    const extraWait = Math.min(Number(waitForMs) || 0, 30000);
-    const selectorToWait = waitForSelector || null;
-    const selectorTimeout = Math.min(Number(waitForSelectorTimeout) || 30000, 60000);
-    
     const context = await global.browser
       .createBrowserContext({
         proxyServer: proxy ? `http://${proxy.host}:${proxy.port}` : undefined,
@@ -17,10 +13,9 @@ function getSource({ url, proxy, waitForMs, waitForSelector, waitForSelectorTime
     if (!context) return reject("Failed to create browser context");
 
     let isResolved = false;
-
-    var cl = setTimeout(async () => {
+    const cl = setTimeout(async () => {
       if (!isResolved) {
-        await context.close();
+        await context.close().catch(() => {});
         reject("Timeout Error");
       }
     }, global.timeOut || 60000);
@@ -28,11 +23,10 @@ function getSource({ url, proxy, waitForMs, waitForSelector, waitForSelectorTime
     try {
       const page = await context.newPage();
       await applyFingerprint(page);
+      await page.setUserAgent(pick(USER_AGENTS));
 
-      if (cookies && Array.isArray(cookies) && cookies.length > 0) {
-        await page.setCookie(...cookies);
-      }
-
+      if (cookies?.length > 0) await page.setCookie(...cookies);
+      
       if (proxy?.username && proxy?.password) {
         await page.authenticate({
           username: proxy.username,
@@ -41,51 +35,43 @@ function getSource({ url, proxy, waitForMs, waitForSelector, waitForSelectorTime
       }
 
       await page.setRequestInterception(true);
-      page.on("request", (request) => {
-        const type = request.resourceType();
-        if (["image", "font", "media", "stylesheet"].includes(type) || request.url().includes("google-analytics") || request.url().includes("doubleclick")) {
-          request.abort();
+      page.on("request", (req) => {
+        const resource = req.resourceType();
+        if (["image", "media", "font"].includes(resource)) {
+          req.abort();
         } else {
-          request.continue();
+          req.continue();
         }
       });
-      
-      page.on("response", async (res) => {
-        try {
-          if (
-            [200, 302].includes(res.status()) &&
-            [url, url + "/"].includes(res.url())
-          ) {
-            await page
-              .waitForNavigation({ waitUntil: "load", timeout: 8000 })
-              .catch(() => {});
-              
-            if (selectorToWait) {
-              await page
-                .waitForSelector(selectorToWait, { timeout: selectorTimeout })
-                .catch(() => {});
-            } else if (extraWait > 0) {
-              await new Promise((r) => setTimeout(r, extraWait));
-            }
-            
-            const html = await page.content();
-            await context.close();
-            isResolved = true;
-            clearInterval(cl);
-            resolve(html);
-          }
-        } catch (e) {}
-      });
 
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 60000
-      });
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+
+      await page.waitForFunction(() => {
+        const selectors = ['#cf-challenge', '#challenge-running', '#challenge-form', '#trk_jschal_js', '.ray_id', '.loading-msg'];
+        const isCF = selectors.some(s => document.querySelector(s));
+        const isCFTitle = /Just a moment|Attention Required|Cloudflare/i.test(document.title);
+        return !isCF && !isCFTitle && document.readyState === 'complete';
+      }, { timeout: 30000, polling: 2000 }).catch(() => {});
+
+      if (waitForSelector) {
+        await page.waitForSelector(waitForSelector, { 
+          timeout: Math.min(waitForSelectorTimeout || 30000, 60000) 
+        }).catch(() => {});
+      } else if (waitForMs) {
+        await new Promise(r => setTimeout(r, Math.min(waitForMs, 30000)));
+      }
+
+      const html = await page.content();
+      
+      isResolved = true;
+      clearTimeout(cl);
+      await context.close();
+      resolve(html);
 
     } catch (e) {
       if (!isResolved) {
-        await context.close();
-        clearInterval(cl);
+        clearTimeout(cl);
+        await context.close().catch(() => {});
         reject(e.message);
       }
     }
