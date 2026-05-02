@@ -1,0 +1,63 @@
+const express = require('express')
+const app = express()
+const port = process.env.SERVER_PORT || 3000
+const server_name = process.env.SERVER_NAME || "default"
+const bodyParser = require('body-parser')
+const authToken = process.env.authToken || null
+const cors = require('cors')
+const reqValidate = require('./module/reqValidate')
+
+global.browserLength = 0
+global.browserLimit = Number(process.env.browserLimit) || 20
+global.timeOut = Number(process.env.timeOut || 60000)
+global.finished = false
+
+app.use(bodyParser.json({}))
+app.use(bodyParser.urlencoded({ extended: true }))
+app.use(cors())
+
+if (process.env.SKIP_LAUNCH != 'true') require('./module/createBrowser')
+
+const getSource = require('./endpoints/getSource')
+const solveTurnstileMin = require('./endpoints/solveTurnstile.min')
+const solveTurnstileMax = require('./endpoints/solveTurnstile.max')
+const wafSession = require('./endpoints/wafSession')
+
+app.post('/cf-clearance-scraper', async (req, res) => {
+    const data = req.body
+    const check = reqValidate(data)
+
+    if (check !== true) return res.status(400).json({ code: 400, message: 'Bad Request', schema: check })
+    if (authToken && data.authToken !== authToken) return res.status(401).json({ code: 401, message: 'Cloudflare: Unauthorized' })
+    if (global.browserLength >= global.browserLimit) return res.status(429).json({ code: 429, message: 'Cloudflare: limit open browser' })
+    if (process.env.SKIP_LAUNCH != 'true' && !global.browser) return res.status(500).json({ code: 500, message: 'Cloudflare: Scanner not ready' })
+
+    global.browserLength++
+    var result = { code: 500 }
+
+    switch (data.mode) {
+        case "source":
+            result = await getSource(data).then(res => { return { source: res, code: 200 } }).catch(err => { return { code: 500, message: err.message || err } })
+            break;
+        case "turnstile-min":
+            result = await solveTurnstileMin(data).then(res => { return { token: res, code: 200 } }).catch(err => { return { code: 500, message: err.message || err } })
+            break;
+        case "turnstile-max":
+            result = await solveTurnstileMax(data).then(res => { return { token: res, code: 200 } }).catch(err => { return { code: 500, message: err.message || err } })
+            break;
+        case "waf-session":
+            result = await wafSession(data).then(res => { return { ...res, code: 200 } }).catch(err => { return { code: 500, message: err.message || err } })
+            break;
+    }
+
+    global.browserLength--
+    res.status(result.code ?? 500).send(result)
+})
+
+app.use((req, res) => { res.status(404).json({ code: 404, message: 'Not Found' }) })
+
+if (process.env.NODE_ENV !== 'development') {
+    app.listen(port, () => { console.log(`Server ${server_name} running on port ${port}`) })
+}
+
+if (process.env.NODE_ENV == 'development') module.exports = app
